@@ -14,6 +14,8 @@ import io.legado.app.help.CacheManager
 import io.legado.app.help.book.BookHelp
 import io.legado.app.help.book.ContentProcessor
 import io.legado.app.help.book.isLocal
+import io.legado.app.help.book.isAudio
+import io.legado.app.constant.BookSourceType
 import io.legado.app.help.config.AppConfig
 import io.legado.app.help.glide.ImageLoader
 import io.legado.app.model.BookCover
@@ -22,12 +24,15 @@ import io.legado.app.model.ReadBook
 import io.legado.app.model.localBook.LocalBook
 import io.legado.app.model.webBook.WebBook
 import io.legado.app.utils.GSON
+import io.legado.app.utils.LogUtils
 import io.legado.app.utils.cnCompare
 import io.legado.app.utils.fromJsonObject
 import io.legado.app.utils.printOnDebug
 import io.legado.app.utils.stackTraceStr
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import splitties.init.appCtx
 import java.io.File
 import java.util.WeakHashMap
@@ -223,6 +228,73 @@ object BookController {
     }
 
     /**
+     * 获取音频播放地址 (suspend, 避免阻塞 Ktor 线程)
+     */
+    suspend fun getAudioUrl(parameters: Map<String, List<String>>): ReturnData {
+        val bookUrl = parameters["url"]?.firstOrNull()
+        val index = parameters["index"]?.firstOrNull()?.toIntOrNull()
+        val returnData = ReturnData()
+        if (bookUrl.isNullOrEmpty()) {
+            return returnData.setErrorMsg("参数url不能为空，请指定书籍地址")
+        }
+        if (index == null || index < 0) {
+            return returnData.setErrorMsg("参数index不能为空或负数, 请指定目录序号")
+        }
+        // 清洗 URL：去掉查询参数和可能的 _payload.json 后缀，提取书籍基础 URL
+        var cleanUrl = bookUrl.substringBefore("?")
+        if (cleanUrl.endsWith("/_payload.json")) {
+            cleanUrl = cleanUrl.removeSuffix("/_payload.json")
+        }
+        val book = appDb.bookDao.getBook(cleanUrl)
+            ?: appDb.bookDao.getBook("$cleanUrl/_payload.json")
+            ?: appDb.bookDao.getBook(bookUrl)
+            ?: return returnData.setErrorMsg("未找到书籍")
+        if (!book.isAudio) {
+            // 尝试通过名字和作者匹配（兜底）
+            val fallbackBook = appDb.bookDao.getBook(book.name, book.author)
+            if (fallbackBook != null && fallbackBook.isAudio) {
+                return try {
+                    val fbChapter = appDb.bookChapterDao.getChapter(fallbackBook.bookUrl, index)
+                        ?: return returnData.setErrorMsg("未找到章节")
+                    val fbSource = appDb.bookSourceDao.getBookSource(fallbackBook.origin)
+                        ?: return returnData.setErrorMsg("未找到书源")
+                    val audioUrl = withContext(Dispatchers.IO) {
+                        WebBook.getContentAwait(fbSource, fallbackBook, fbChapter)
+                    }
+                    if (audioUrl.isBlank()) return returnData.setErrorMsg("音频地址为空")
+                    if (audioUrl.startsWith("<") || audioUrl.length > 2048) return returnData.setErrorMsg("音频地址格式异常")
+                    returnData.setData(mapOf("play_url" to audioUrl))
+                } catch (e: Exception) {
+                    LogUtils.e("getAudioUrl", e.stackTraceStr)
+                    returnData.setErrorMsg(e.localizedMessage ?: e.javaClass.simpleName)
+                }
+            }
+            return returnData.setErrorMsg("该书籍不是有声书")
+        }
+        val chapter = appDb.bookChapterDao.getChapter(book.bookUrl, index)
+            ?: return returnData.setErrorMsg("未找到章节")
+        val bookSource = appDb.bookSourceDao.getBookSource(book.origin)
+            ?: return returnData.setErrorMsg("未找到书源")
+        return try {
+            // 在 IO 调度器上执行 WebView 操作, 不阻塞 Ktor 事件循环
+            val audioUrl = withContext(Dispatchers.IO) {
+                WebBook.getContentAwait(bookSource, book, chapter)
+            }
+            // 校验提取结果是否为合法音频 URL
+            if (audioUrl.isBlank()) {
+                return returnData.setErrorMsg("音频地址为空")
+            }
+            if (audioUrl.startsWith("<") || audioUrl.length > 2048) {
+                return returnData.setErrorMsg("音频地址格式异常")
+            }
+            returnData.setData(mapOf("play_url" to audioUrl))
+        } catch (e: Exception) {
+            LogUtils.e("getAudioUrl", e.stackTraceStr)
+            returnData.setErrorMsg(e.localizedMessage ?: e.javaClass.simpleName)
+        }
+    }
+
+    /**
      * 保存书籍
      */
     suspend fun saveBook(postData: String?): ReturnData {
@@ -255,19 +327,37 @@ object BookController {
         GSON.fromJsonObject<BookProgress>(postData)
             .onFailure { it.printOnDebug() }
             .getOrNull()?.let { bookProgress ->
-                appDb.bookDao.getBook(bookProgress.name, bookProgress.author)?.let { book ->
-                    book.durChapterIndex = bookProgress.durChapterIndex
-                    book.durChapterPos = bookProgress.durChapterPos
-                    book.durChapterTitle = bookProgress.durChapterTitle
-                    book.durChapterTime = bookProgress.durChapterTime
-                    AppWebDav.uploadBookProgress(bookProgress) {
-                        book.syncTime = System.currentTimeMillis()
+                // 优先使用 bookUrl 精确匹配，清洗 URL 参数
+                var cleanUrl = bookProgress.bookUrl
+                if (cleanUrl != null) {
+                    cleanUrl = cleanUrl.substringBefore("?")
+                    if (cleanUrl.endsWith("/_payload.json")) {
+                        cleanUrl = cleanUrl.removeSuffix("/_payload.json")
                     }
-                    appDb.bookDao.update(book)
-                    ReadBook.book?.let {
-                        if (it.name == bookProgress.name &&
-                            it.author == bookProgress.author
-                        ) {
+                }
+                val book = if (!bookProgress.bookUrl.isNullOrBlank()) {
+                    appDb.bookDao.getBook(cleanUrl!!)
+                        ?: appDb.bookDao.getBook("${cleanUrl}/_payload.json")
+                        ?: appDb.bookDao.getBook(bookProgress.bookUrl)
+                } else {
+                    null
+                } ?: appDb.bookDao.getBook(bookProgress.name, bookProgress.author)
+                book?.let {
+                    it.durChapterIndex = bookProgress.durChapterIndex
+                    it.durChapterPos = bookProgress.durChapterPos
+                    it.durChapterTitle = bookProgress.durChapterTitle
+                    it.durChapterTime = bookProgress.durChapterTime
+                    AppWebDav.uploadBookProgress(bookProgress) {
+                        it.syncTime = System.currentTimeMillis()
+                    }
+                    appDb.bookDao.update(it)
+                    ReadBook.book?.let { readBook ->
+                        val urlMatch = bookProgress.bookUrl != null && readBook.bookUrl == bookProgress.bookUrl
+                        val nameMatch = bookProgress.bookUrl.isNullOrBlank() && readBook.name == bookProgress.name && readBook.author == bookProgress.author
+                        if (urlMatch || nameMatch) {
+                            readBook.durChapterIndex = bookProgress.durChapterIndex
+                            readBook.durChapterPos = bookProgress.durChapterPos
+                            readBook.durChapterTitle = bookProgress.durChapterTitle
                             ReadBook.webBookProgress = bookProgress
                         }
                     }

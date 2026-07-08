@@ -44,12 +44,12 @@ object ExoPlayerHelper {
     fun createHttpExoPlayer(context: Context): ExoPlayer {
         return ExoPlayer.Builder(context).setLoadControl(
             DefaultLoadControl.Builder().setBufferDurationsMs(
-                DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
-                DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,
-                DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS / 10,
-                DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS / 10
+                // 增加缓冲时长，改善 m4a 文件进度准确性
+                30_000,   // minBufferMs: 30秒
+                120_000,  // maxBufferMs: 120秒
+                5_000,    // bufferForPlaybackMs: 5秒
+                10_000    // bufferForPlaybackAfterRebufferMs: 10秒
             ).build()
-
         ).setMediaSourceFactory(
             DefaultMediaSourceFactory(context)
                 .setDataSourceFactory(resolvingDataSource)
@@ -93,7 +93,7 @@ object ExoPlayerHelper {
             .setCacheWriteDataSinkFactory(
                 CacheDataSink.Factory()
                     .setCache(cache)
-                    .setFragmentSize(CacheDataSink.DEFAULT_FRAGMENT_SIZE)
+                    .setFragmentSize(Long.MAX_VALUE)
             )
     }
 
@@ -102,7 +102,7 @@ object ExoPlayerHelper {
      */
     private val okhttpDataFactory by lazy {
         val client = okHttpClient.newBuilder()
-            .callTimeout(0, TimeUnit.SECONDS)
+            .callTimeout(30, TimeUnit.SECONDS)
             .build()
         OkHttpDataSource.Factory(client)
             .setCacheControl(CacheControl.Builder().maxAge(1, TimeUnit.DAYS).build())
@@ -116,8 +116,8 @@ object ExoPlayerHelper {
         return@lazy SimpleCache(
             //Exoplayer的缓存路径
             File(appCtx.externalCache, "exoplayer"),
-            //100M的缓存
-            LeastRecentlyUsedCacheEvictor((100 * 1024 * 1024).toLong()),
+            //200M的缓存，支持大音频文件完整缓存以读取时长
+            LeastRecentlyUsedCacheEvictor(200L * 1024 * 1024),
             //记录缓存的数据库
             databaseProvider
         )

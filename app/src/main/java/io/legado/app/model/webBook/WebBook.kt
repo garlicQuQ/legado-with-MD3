@@ -9,9 +9,11 @@ import io.legado.app.data.entities.SearchBook
 import io.legado.app.exception.NoStackTraceException
 import io.legado.app.help.book.addType
 import io.legado.app.help.book.removeAllBookType
+import io.legado.app.help.book.isAudio
 import io.legado.app.help.coroutine.Coroutine
 import io.legado.app.help.http.StrResponse
 import io.legado.app.help.source.getBookType
+import io.legado.app.constant.BookSourceType
 import io.legado.app.model.Debug
 import io.legado.app.model.analyzeRule.AnalyzeRule
 import io.legado.app.model.analyzeRule.AnalyzeRule.Companion.setCoroutineContext
@@ -404,6 +406,14 @@ object WebBook {
         if (bookChapter.isVolume && bookChapter.url.startsWith(bookChapter.title)) {
             Debug.log(bookSource.bookSourceUrl, "⇒一级目录正文不解析规则")
             return bookChapter.tag ?: ""
+        }
+        // 音频书直接返回章节URL，不下载内容（避免OOM）
+        // 仅当没有 webJs 需要执行时才提前返回，
+        // 否则 webJs 异步提取真实音频地址的逻辑会被完全跳过，导致播放失败
+        if ((book.isAudio || bookSource.bookSourceType == BookSourceType.audio)
+            && bookSource.getContentRule().webJs.isNullOrEmpty()
+        ) {
+            return bookChapter.getAbsoluteURL()
         }
         return if (bookChapter.url == book.bookUrl && !book.tocHtml.isNullOrEmpty()) {
             BookContent.analyzeContent(
